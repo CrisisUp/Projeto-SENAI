@@ -1,0 +1,239 @@
+Vagrant.configure("2") do |config|
+  config.vm.boot_timeout = 600
+  
+  # Desabilita o compartilhamento de pastas padrão (evita erros de Guest Additions)
+  config.vm.synced_folder ".", "/vagrant", disabled: true 
+
+  # ==========================================
+  # 1. FIREWALL DA MATRIZ (GATEWAY & SEGMENTAÇÃO)
+  # ==========================================
+  config.vm.define "firewall-matriz" do |fw|
+    fw.vm.box = "ubuntu/jammy64"
+    fw.vm.hostname = "fw-matriz"
+    
+    fw.vm.provider "virtualbox" do |vb|
+      vb.memory = "1024"
+      vb.cpus = 1
+      vb.name = "Firewall-Matriz"
+    end
+
+    # Porta SSH fixa para o Firewall
+    fw.vm.network "forwarded_port", guest: 22, host: 2222, id: "ssh", auto_correct: false
+
+    # Interfaces de Rede (WAN Bridge + VLANs Internas)
+    fw.vm.network "public_network", bridge: "Intel(R) Wi-Fi 6 AX201 160MHz"
+    fw.vm.network "private_network", ip: "10.0.3.254", virtualbox__intnet: "VLAN3"
+    fw.vm.network "private_network", ip: "10.0.5.254", virtualbox__intnet: "VLAN5"
+    fw.vm.network "private_network", ip: "10.0.8.254", virtualbox__intnet: "VLAN8"
+    fw.vm.network "private_network", ip: "10.0.10.254", virtualbox__intnet: "VLAN10"
+
+    # PROVISIONAMENTO: Roteamento, NAT e Regras de Firewall por VLAN
+    fw.vm.provision "shell", inline: <<-SHELL
+      echo "Configurando o Firewall, Roteamento e Políticas de VLAN..."
+      
+      # Habilita encaminhamento de pacotes IPv4
+      sysctl -w net.ipv4.ip_forward=1
+      grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
+      # Limpa regras anteriores para evitar duplicação ao reprovisionar
+      iptables -F
+      iptables -t nat -F
+      iptables -X
+
+      # Política padrão: bloqueia encaminhamento não autorizado entre VLANs
+      iptables -P INPUT ACCEPT
+      iptables -P OUTPUT ACCEPT
+      iptables -P FORWARD DROP
+
+      # Permite retorno de conexões já estabelecidas
+      iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+      # NAT para saída à Internet (via enp0s3 ou enp0s8 bridge)
+      iptables -t nat -A POSTROUTING -o enp0s3 -j MASQUERADE
+      iptables -t nat -A POSTROUTING -o enp0s8 -j MASQUERADE
+
+      # 1. Acesso à Internet a partir das redes corporativas (VLAN 3, 5 e 8)
+      iptables -A FORWARD -s 10.0.3.0/24 -o enp0s3 -j ACCEPT
+      iptables -A FORWARD -s 10.0.5.0/24 -o enp0s3 -j ACCEPT
+      iptables -A FORWARD -s 10.0.8.0/24 -o enp0s3 -j ACCEPT
+
+      # 2. Regras da TI (VLAN 8): acesso aos Servidores (VLAN 3), Colaboradores (VLAN 5) e IoT (VLAN 10)
+      iptables -A FORWARD -s 10.0.8.0/24 -d 10.0.3.0/24 -j ACCEPT
+      iptables -A FORWARD -s 10.0.8.0/24 -d 10.0.5.0/24 -j ACCEPT
+      iptables -A FORWARD -s 10.0.8.0/24 -d 10.0.10.0/24 -j ACCEPT
+
+      # 3. Regras dos Colaboradores (VLAN 5): acessam apenas aplicações nos Servidores (VLAN 3) e monitoramento IoT (porta 8080)
+      iptables -A FORWARD -s 10.0.5.0/24 -d 10.0.3.10 -p tcp -m multiport --dports 80,443,3000,8000,8080 -j ACCEPT
+      iptables -A FORWARD -s 10.0.5.0/24 -d 10.0.10.10 -p tcp --dport 8080 -j ACCEPT
+
+      # 4. Regras da VLAN 10 (IoT): rede apartada, permite apenas envio de logs (Syslog 514) ao Servidor App
+      iptables -A FORWARD -s 10.0.10.0/24 -d 10.0.3.10 -p udp --dport 514 -j ACCEPT
+
+      # Instalação não-interativa e persistência das regras
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y
+      apt-get install -y iptables-persistent
+      netfilter-persistent save
+    SHELL
+  end
+
+  # ==========================================
+  # 2. SERVIDOR APP (VLAN 3)
+  # ==========================================
+  config.vm.define "servidor-app" do |srv|
+    srv.vm.box = "ubuntu/jammy64"
+    srv.vm.hostname = "srv-app"
+    
+    srv.vm.provider "virtualbox" do |vb|
+      vb.memory = "1024"
+      vb.name = "Srv-App-Matriz"
+    end
+    
+    srv.vm.network "forwarded_port", guest: 22, host: 2200, id: "ssh", auto_correct: false
+    srv.vm.network "private_network", ip: "10.0.3.10", virtualbox__intnet: "VLAN3"
+
+    srv.vm.provision "shell", inline: <<-SHELL
+      echo "Configurando Rota Padrão (Gateway) para a VLAN3..."
+      ip route replace default via 10.0.3.254 dev enp0s8
+    SHELL
+  end
+
+  # ==========================================
+  # 3. COLABORADOR (VLAN 5)
+  # ==========================================
+  config.vm.define "pc-colaborador" do |pc|
+    pc.vm.box = "ubuntu/jammy64" 
+    pc.vm.hostname = "pc-colab"
+    
+    pc.vm.provider "virtualbox" do |vb|
+      vb.memory = "512"
+      vb.name = "PC-Colaborador"
+    end
+    
+    pc.vm.network "forwarded_port", guest: 22, host: 2201, id: "ssh", auto_correct: false
+    pc.vm.network "private_network", ip: "10.0.5.10", virtualbox__intnet: "VLAN5"
+
+    pc.vm.provision "shell", inline: <<-SHELL
+      echo "Configurando Rota Padrão (Gateway) para a VLAN5..."
+      ip route replace default via 10.0.5.254 dev enp0s8
+    SHELL
+  end
+
+  # ==========================================
+  # 4. TI (VLAN 8)
+  # ==========================================
+  config.vm.define "pc-ti" do |ti|
+    ti.vm.box = "ubuntu/jammy64"
+    ti.vm.hostname = "pc-ti"
+    
+    ti.vm.provider "virtualbox" do |vb|
+      vb.memory = "512"
+      vb.name = "PC-TI"
+    end
+    
+    ti.vm.network "forwarded_port", guest: 22, host: 2205, id: "ssh", auto_correct: false
+    ti.vm.network "private_network", ip: "10.0.8.10", virtualbox__intnet: "VLAN8"
+
+    ti.vm.provision "shell", inline: <<-SHELL
+      echo "Configurando Rota Padrão (Gateway) para a VLAN8..."
+      ip route replace default via 10.0.8.254 dev enp0s8
+    SHELL
+  end
+
+  # ==========================================
+  # 5. SENSORES IoT & ALARME (VLAN 10)
+  # ==========================================
+  config.vm.define "iot-matriz" do |iot|
+    iot.vm.box = "ubuntu/jammy64"
+    iot.vm.hostname = "iot-matriz"
+    
+    iot.vm.provider "virtualbox" do |vb|
+      vb.memory = "512"
+      vb.cpus = 1
+      vb.name = "IoT-Matriz"
+    end
+    
+    # Porta SSH fixa para o IoT
+    iot.vm.network "forwarded_port", guest: 22, host: 2210, id: "ssh", auto_correct: false
+    iot.vm.network "private_network", ip: "10.0.10.10", virtualbox__intnet: "VLAN10"
+
+    # PROVISIONAMENTO: Gateway na VLAN10 e serviço simulador de sensores (PIR, LDR, Ultrassônico)
+    iot.vm.provision "shell", inline: <<-SHELL
+      echo "Configurando Rota Padrão (Gateway) para a VLAN10..."
+      ip route replace default via 10.0.10.254 dev enp0s8
+
+      echo "Criando serviço simulador de sensores IoT (PIR, LDR, Ultrassônico)..."
+      cat << 'EOF' > /usr/local/bin/iot_sensores.py
+import json
+import random
+import syslog
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+syslog.openlog(ident="IoT-Matriz-Sensores", facility=syslog.LOG_LOCAL0)
+
+def ler_sensores():
+    hora_atual = datetime.now().hour
+    # Considera fora de expediente antes das 07h ou após as 19h (ou modo teste)
+    fora_expediente = (hora_atual < 7 or hora_atual >= 19)
+    
+    pir_movimento = random.choice([False, False, True])
+    ldr_luminosidade = random.randint(10, 900) # > 500 indica luz acesa
+    ultrassonico_cm = random.randint(20, 250)  # < 50cm indica presença próxima
+
+    anomalia = fora_expediente and (pir_movimento or ldr_luminosidade > 500 or ultrassonico_cm < 50)
+    
+    if anomalia:
+        msg = f"ALARME ACIONADO! PIR={pir_movimento}, LDR={ldr_luminosidade}lx, Dist={ultrassonico_cm}cm"
+        syslog.syslog(syslog.LOG_ALERT, msg)
+    else:
+        msg = "Ambiente normal."
+
+    return {
+        "escritorio": "Matriz",
+        "vlan": 10,
+        "timestamp": datetime.now().isoformat(),
+        "fora_expediente": fora_expediente,
+        "sensores": {
+            "PIR_movimento": pir_movimento,
+            "LDR_luminosidade_lux": ldr_luminosidade,
+            "Ultrassonico_distancia_cm": ultrassonico_cm
+        },
+        "alarme_ativo": anomalia,
+        "status": msg
+    }
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        dados = ler_sensores()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps(dados, indent=2, ensure_ascii=False).encode("utf-8"))
+
+if __name__ == "__main__":
+    server = HTTPServer(("0.0.0.0", 8080), Handler)
+    print("Monitoramento IoT rodando na porta 8080...")
+    server.serve_forever()
+EOF
+
+      # Configura como serviço systemd para rodar em segundo plano
+      cat << 'EOF' > /etc/systemd/system/iot-sensores.service
+[Unit]
+Description=Simulador de Sensores IoT (VLAN 10)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/iot_sensores.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+      systemctl daemon-reload
+      systemctl enable --now iot-sensores.service
+    SHELL
+  end
+end

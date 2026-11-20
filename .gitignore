@@ -1,0 +1,19 @@
+# Diretórios internos e discos do Vagrant / VirtualBox
+.vagrant/
+*.vdi
+*.vmdk
+*.vbox
+*.vbox-prev
+*.ova
+*.ovf
+*.log
+
+# Arquivos temporários e ambiente Python
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+
+# Chaves privadas locais (segurança)
+*.pem
+*_private.key

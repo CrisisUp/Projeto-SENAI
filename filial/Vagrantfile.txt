@@ -1,0 +1,185 @@
+Vagrant.configure("2") do |config|
+  config.vm.boot_timeout = 600
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  # ==========================================
+  # 1. FIREWALL DA FILIAL
+  # ==========================================
+  config.vm.define "firewall-filial" do |fw|
+    fw.vm.box = "ubuntu/jammy64"
+    fw.vm.hostname = "fw-filial"
+
+    fw.vm.provider "virtualbox" do |vb|
+      vb.memory = "1024"
+      vb.cpus = 1
+      vb.name = "Firewall-Filial"
+    end
+
+    # Porta SSH fixa no host (diferente da Matriz)
+    fw.vm.network "forwarded_port", guest: 22, host: 2322, id: "ssh", auto_correct: false
+
+    # Interfaces de Rede (WAN Bridge + Rede Vendas + VLAN 10 IoT Filial)
+    fw.vm.network "public_network", bridge: "Intel(R) Wi-Fi 6 AX201 160MHz"
+    fw.vm.network "private_network", ip: "10.1.20.254", virtualbox__intnet: "FILIAL-VENDAS"
+    fw.vm.network "private_network", ip: "10.1.10.254", virtualbox__intnet: "FILIAL-VLAN10"
+
+    fw.vm.provision "shell", inline: <<-SHELL
+      echo "Configurando Firewall da Filial e Políticas de Segurança..."
+
+      sysctl -w net.ipv4.ip_forward=1
+      grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
+      iptables -F
+      iptables -t nat -F
+      iptables -X
+
+      iptables -P INPUT ACCEPT
+      iptables -P OUTPUT ACCEPT
+      iptables -P FORWARD DROP
+
+      # Permite retorno de conexões já estabelecidas
+      iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+      # NAT temporário (será substituído pelo roteamento via VPN da Matriz no próximo passo)
+      iptables -t nat -A POSTROUTING -o enp0s3 -j MASQUERADE
+
+      # 1. BLOQUEIO ESTRITO: PCs da Filial não acessam PCs da Matriz (VLAN 5 e VLAN 8) e vice-versa
+      iptables -A FORWARD -s 10.1.20.0/24 -d 10.0.5.0/24 -j DROP
+      iptables -A FORWARD -s 10.1.20.0/24 -d 10.0.8.0/24 -j DROP
+      iptables -A FORWARD -s 10.0.5.0/24 -d 10.1.20.0/24 -j DROP
+      iptables -A FORWARD -s 10.0.8.0/24 -d 10.1.20.0/24 -j DROP
+
+      # 2. CONTROLE DE ACESSO (NAC por MAC Address): Apenas o PC autorizado da empresa acessa a rede de vendas
+      iptables -A FORWARD -s 10.1.20.10 -m mac --mac-source 08:00:27:AA:BB:10 -d 10.0.3.10 -p tcp -m multiport --dports 80,443,3000,8000,8080 -j ACCEPT
+      iptables -A FORWARD -s 10.1.20.10 -m mac --mac-source 08:00:27:AA:BB:10 -d 10.1.10.10 -p tcp --dport 8080 -j ACCEPT
+      iptables -A FORWARD -s 10.1.20.10 -m mac --mac-source 08:00:27:AA:BB:10 -d 10.0.10.10 -p tcp --dport 8080 -j ACCEPT
+      iptables -A FORWARD -s 10.1.20.10 -m mac --mac-source 08:00:27:AA:BB:10 -o enp0s3 -j ACCEPT
+
+      # 3. VLAN 10 (IoT Filial): Rede apartada, acessível pela TI da Matriz (VLAN 8) e envia logs ao Servidor App (VLAN 3)
+      iptables -A FORWARD -s 10.0.8.0/24 -d 10.1.10.0/24 -p tcp -m multiport --dports 22,8080 -j ACCEPT
+      iptables -A FORWARD -s 10.1.10.0/24 -d 10.0.3.10 -p udp --dport 514 -j ACCEPT
+
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y
+      apt-get install -y iptables-persistent wireguard
+      netfilter-persistent save
+    SHELL
+  end
+
+  # ==========================================
+  # 2. PC VENDAS - FILIAL (REDE VENDAS)
+  # ==========================================
+  config.vm.define "pc-vendas-filial" do |pc|
+    pc.vm.box = "ubuntu/jammy64"
+    pc.vm.hostname = "pc-vendas-filial"
+
+    pc.vm.provider "virtualbox" do |vb|
+      vb.memory = "512"
+      vb.name = "PC-Vendas-Filial"
+    end
+
+    pc.vm.network "forwarded_port", guest: 22, host: 2301, id: "ssh", auto_correct: false
+    # Define MAC Address fixo autorizado no firewall da Filial
+    pc.vm.network "private_network", ip: "10.1.20.10", mac: "080027AABB10", virtualbox__intnet: "FILIAL-VENDAS"
+
+    pc.vm.provision "shell", inline: <<-SHELL
+      echo "Configurando Rota Padrão (Gateway) da Filial..."
+      ip route replace default via 10.1.20.254 dev enp0s8
+    SHELL
+  end
+
+  # ==========================================
+  # 3. SENSORES IoT & ALARME - FILIAL (VLAN 10)
+  # ==========================================
+  config.vm.define "iot-filial" do |iot|
+    iot.vm.box = "ubuntu/jammy64"
+    iot.vm.hostname = "iot-filial"
+
+    iot.vm.provider "virtualbox" do |vb|
+      vb.memory = "512"
+      vb.cpus = 1
+      vb.name = "IoT-Filial"
+    end
+
+    iot.vm.network "forwarded_port", guest: 22, host: 2310, id: "ssh", auto_correct: false
+    iot.vm.network "private_network", ip: "10.1.10.10", virtualbox__intnet: "FILIAL-VLAN10"
+
+    iot.vm.provision "shell", inline: <<-SHELL
+      echo "Configurando Rota Padrão (Gateway) para a VLAN 10 da Filial..."
+      ip route replace default via 10.1.10.254 dev enp0s8
+
+      # Encaminhamento remoto de logs para o Servidor App da Matriz via VPN
+      echo 'local0.* @10.0.3.10:514' > /etc/rsyslog.d/50-iot-remoto.conf
+      systemctl restart rsyslog
+
+      cat << 'EOF' > /usr/local/bin/iot_sensores.py
+import json
+import random
+import syslog
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+syslog.openlog(ident="IoT-Filial-Sensores", facility=syslog.LOG_LOCAL0)
+
+def ler_sensores():
+    hora_atual = datetime.now().hour
+    fora_expediente = (hora_atual < 7 or hora_atual >= 19)
+
+    pir_movimento = random.choice([False, False, True])
+    ldr_luminosidade = random.randint(10, 900)
+    ultrassonico_cm = random.randint(20, 250)
+
+    anomalia = fora_expediente and (pir_movimento or ldr_luminosidade > 500 or ultrassonico_cm < 50)
+
+    if anomalia:
+        msg = f"ALARME ACIONADO (FILIAL)! PIR={pir_movimento}, LDR={ldr_luminosidade}lx, Dist={ultrassonico_cm}cm"
+        syslog.syslog(syslog.LOG_ALERT, msg)
+    else:
+        msg = "Ambiente normal."
+
+    return {
+        "escritorio": "Filial (Vendas)",
+        "vlan": 10,
+        "timestamp": datetime.now().isoformat(),
+        "fora_expediente": fora_expediente,
+        "sensores": {
+            "PIR_movimento": pir_movimento,
+            "LDR_luminosidade_lux": ldr_luminosidade,
+            "Ultrassonico_distancia_cm": ultrassonico_cm
+        },
+        "alarme_ativo": anomalia,
+        "status": msg
+    }
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        dados = ler_sensores()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps(dados, indent=2, ensure_ascii=False).encode("utf-8"))
+
+if __name__ == "__main__":
+    server = HTTPServer(("0.0.0.0", 8080), Handler)
+    server.serve_forever()
+EOF
+
+      cat << 'EOF' > /etc/systemd/system/iot-sensores.service
+[Unit]
+Description=Simulador de Sensores IoT Filial (VLAN 10)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/iot_sensores.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+      systemctl daemon-reload
+      systemctl enable --now iot-sensores.service
+    SHELL
+  end
+end

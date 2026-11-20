@@ -1,0 +1,87 @@
+Vagrant.configure("2") do |config|
+  config.vm.boot_timeout = 600
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  config.vm.define "nuvem-db" do |cloud|
+    cloud.vm.box = "ubuntu/jammy64"
+    cloud.vm.hostname = "nuvem-db"
+
+    cloud.vm.provider "virtualbox" do |vb|
+      vb.memory = "1024"
+      vb.cpus = 1
+      vb.name = "Nuvem-DB"
+    end
+
+    # Porta SSH exclusiva no host
+    cloud.vm.network "forwarded_port", guest: 22, host: 2422, id: "ssh", auto_correct: false
+
+    # Interfaces: WAN Bridge (para receber túneis VPN) + Rede Privada VPC Nuvem
+    cloud.vm.network "public_network", bridge: "Intel(R) Wi-Fi 6 AX201 160MHz"
+    cloud.vm.network "private_network", ip: "10.2.0.10", virtualbox__intnet: "NUVEM-VPC"
+
+    cloud.vm.provision "shell", inline: <<-SHELL
+      echo "1. Configurando roteamento e pacotes da Nuvem (PostgreSQL, WireGuard, FRR)..."
+      sysctl -w net.ipv4.ip_forward=1
+      grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y
+      apt-get install -y postgresql postgresql-contrib wireguard frr iptables-persistent
+
+      echo "2. Configurando Banco de Dados PostgreSQL (Privilégio Mínimo + SSL)..."
+      sudo -u postgres psql -c "CREATE USER app_user WITH PASSWORD 'SenhaForteNuvem2026!';"
+      sudo -u postgres psql -c "CREATE DATABASE senai_clientes OWNER app_user;"
+
+      sudo -u postgres psql -d senai_clientes -c "
+        CREATE TABLE clientes (
+          id SERIAL PRIMARY KEY,
+          nome VARCHAR(150) NOT NULL,
+          cpf_cnpj VARCHAR(20) NOT NULL UNIQUE,
+          email VARCHAR(120) NOT NULL,
+          telefone VARCHAR(30),
+          origem_cadastro VARCHAR(45),
+          criado_por VARCHAR(50),
+          criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO app_user;
+        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user;
+      "
+
+      PG_CONF="/etc/postgresql/14/main/postgresql.conf"
+      PG_HBA="/etc/postgresql/14/main/pg_hba.conf"
+
+      sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '127.0.0.1,10.2.0.10'/" "$PG_CONF"
+      echo "hostssl senai_clientes app_user 10.0.3.10/32 scram-sha-256" >> "$PG_HBA"
+      systemctl restart postgresql
+
+      echo "3. Gerando chaves WireGuard da Nuvem..."
+      mkdir -p /etc/wireguard && chmod 700 /etc/wireguard
+      wg genkey | tee /etc/wireguard/nuvem_private.key | wg pubkey > /etc/wireguard/nuvem_public.key
+      chmod 600 /etc/wireguard/nuvem_private.key
+
+      echo "4. Aplicando Security Group (Firewall iptables restritivo)..."
+      iptables -F
+      iptables -P INPUT DROP
+      iptables -P FORWARD DROP
+      iptables -P OUTPUT ACCEPT
+
+      iptables -A INPUT -i lo -j ACCEPT
+      iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      # SSH Vagrant (NAT) e Portas UDP do Anel WireGuard na WAN
+      iptables -A INPUT -i enp0s3 -p tcp --dport 22 -j ACCEPT
+      iptables -A INPUT -p udp --dport 51820:51821 -j ACCEPT
+      # OSPF sobre os túneis VPN (protocolo 89) e Ping de monitoramento
+      iptables -A INPUT -i wg+ -p ospf -j ACCEPT
+      iptables -A INPUT -i wg+ -p icmp -j ACCEPT
+      # SSH administrativo apenas da TI da Matriz (VLAN 8) e PostgreSQL apenas do Servidor App (VLAN 3)
+      iptables -A INPUT -i wg+ -s 10.0.8.0/24 -p tcp --dport 22 -j ACCEPT
+      iptables -A INPUT -i wg+ -s 10.0.3.10 -p tcp --dport 5432 -j ACCEPT
+      # Permite trânsito do anel VPN caso a Nuvem atue como rota alternativa entre Matriz e Filial
+      iptables -A FORWARD -i wg+ -o wg+ -j ACCEPT
+
+      netfilter-persistent save
+      echo "=== CHAVE PUBLICA DA NUVEM ==="
+      cat /etc/wireguard/nuvem_public.key
+    SHELL
+  end
+end
